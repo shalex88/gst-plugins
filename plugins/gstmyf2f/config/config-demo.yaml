@@ -1,0 +1,3 @@
+name: name
+processing-lib-path: /home/fronti/gst-plugins/processing-libs/video-stabilization/demo_stabilizer/build/libdemo_stabilizer.so
+debug-first-run: true
