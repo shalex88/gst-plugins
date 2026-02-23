@@ -70,10 +70,16 @@ typedef struct {
     VPIKLTFeatureTrackerParams klt_params;
 
     // Motion estimation
-    float affine_matrix[6];        // [a b tx c d ty]
-    float smoothed_affine[6];      // Temporally filtered
+    float affine_matrix[6];        // [a b tx c d ty] — raw per-frame camera delta
+    float smoothed_affine[6];      // Warp to apply this frame (correction)
 
-    // Motion history for smoothing
+    // Trajectory-based smoothing
+    // traj = accumulated raw camera path; smooth_traj = low-pass of traj
+    // correction = smooth_traj - traj  (how far to shift to follow smooth path)
+    float trajectory[2];           // accumulated (tx, ty)
+    float smoothed_trajectory[2];  // EMA of trajectory
+
+    // Kept for potential future window-based filter
     float motion_history[MOTION_HISTORY_SIZE][6];
     int history_index;
     bool history_full;
@@ -121,6 +127,9 @@ static ProcStatus nv_stab_init(const char* config_path, void** ctx)
     c->affine_matrix[3] = 0.0f; c->affine_matrix[4] = 1.0f; c->affine_matrix[5] = 0.0f;
 
     memcpy(c->smoothed_affine, c->affine_matrix, sizeof(c->affine_matrix));
+
+    c->trajectory[0]          = 0.0f; c->trajectory[1]          = 0.0f;
+    c->smoothed_trajectory[0] = 0.0f; c->smoothed_trajectory[1] = 0.0f;
 
     *ctx = c;
     //printf("[nv-stabilizer] Initialized (VPI resources will be created lazily on first frame)\n");
@@ -201,6 +210,10 @@ static ProcStatus nv_stab_reset_context(NvStabCtx *c, int w, int h, int stride) 
                                                  VPI_IMAGE_FORMAT_Y8, 0, &c->klt_payload));
 
         c->has_prev_features = false;
+
+        // Reset trajectory on dimension change so the new session starts fresh
+        c->trajectory[0]          = 0.0f; c->trajectory[1]          = 0.0f;
+        c->smoothed_trajectory[0] = 0.0f; c->smoothed_trajectory[1] = 0.0f;
         //printf("[nv-stabilizer] Context reset: %dx%d, VPI resources initialized on processing thread\n", w, h);
     }
     return PROC_STATUS_OK;
@@ -365,11 +378,16 @@ static ProcStatus nv_stab_estimate_motion(NvStabCtx* c)
     int num_kpts = *kp_data.buffer.aos.sizePointer;
 
     // Simple block matching at grid points
+    // Sample evenly across the whole grid rather than taking the first N points
+    // (the grid is enumerated top-to-bottom, so the first N are all in the top rows).
     std::vector<float> dxs, dys;
     const int template_size = 15;  // 15x15 template
     const int search_range = 30;   // Search ±30 pixels
+    const int sample_count = std::min(num_kpts, 80);
+    const int step = std::max(1, num_kpts / sample_count);
 
-    for (int k = 0; k < std::min(num_kpts, 50); k++) {
+    for (int ki = 0; ki < num_kpts && (int)dxs.size() < sample_count; ki += step) {
+        int k = ki;
         int x = (int)kpts[k].x;
         int y = (int)kpts[k].y;
 
@@ -432,14 +450,16 @@ static ProcStatus nv_stab_estimate_motion(NvStabCtx* c)
     float med_dx = dxs[dxs.size() / 2];
     float med_dy = dys[dys.size() / 2];
 
-    // Build affine transform (translation only)
-    // Inverse for stabilization: move frame opposite to camera motion
+    // Store raw inter-frame camera displacement (positive = camera moved right/down).
+    // The sign convention is: block match finds where in cur_frame the prev_frame
+    // template reappears, so dx/dy is the camera motion vector.
+    // DO NOT negate or scale here; smoothing will derive the correction.
     c->affine_matrix[0] = 1.0f;
     c->affine_matrix[1] = 0.0f;
-    c->affine_matrix[2] = -med_dx;  // tx (inverse)
+    c->affine_matrix[2] = med_dx;   // raw camera tx this frame
     c->affine_matrix[3] = 0.0f;
     c->affine_matrix[4] = 1.0f;
-    c->affine_matrix[5] = -med_dy;  // ty (inverse)
+    c->affine_matrix[5] = med_dy;   // raw camera ty this frame
 
     //printf("[nv-stabilizer] Block match motion: dx=%.2f dy=%.2f (from %d matches)\n", med_dx, med_dy, (int)dxs.size());
 
@@ -448,26 +468,44 @@ static ProcStatus nv_stab_estimate_motion(NvStabCtx* c)
 
 static void nv_stab_smooth_motion(NvStabCtx* c)
 {
-    // Add current motion to history
-    memcpy(c->motion_history[c->history_index], c->affine_matrix, sizeof(c->affine_matrix));
-    c->history_index = (c->history_index + 1) % MOTION_HISTORY_SIZE;
-    if (c->history_index == 0) c->history_full = true;
+    // Trajectory-based smoothing — the correct approach for video stabilization:
+    //
+    //   1. Accumulate raw camera path:  traj[n] = traj[n-1] + delta[n]
+    //   2. Low-pass the path:           smooth[n] = α·traj[n] + (1-α)·smooth[n-1]
+    //   3. Correction = smooth[n] − traj[n]
+    //
+    // This separates intentional camera motion (slow, low-freq) from jitter
+    // (fast, high-freq). A slow pan accumulates smoothly; high-freq shake
+    // is suppressed. alpha=0.1 gives ~9-frame effective smoothing window.
+    //
+    // Note: affine_matrix[2/5] hold the RAW per-frame camera delta (set in
+    //       estimate_motion), not a correction.
 
-    // Compute exponential moving average
-    const float alpha = 0.3f;  // Smoothing factor (0 = max smooth, 1 = no smooth)
+    const float alpha = 0.1f;  // trajectory smoothing (smaller = smoother / more lag)
 
-    if (!c->history_full && c->history_index == 0) {
-        // First frame, no smoothing yet
-        memcpy(c->smoothed_affine, c->affine_matrix, sizeof(c->affine_matrix));
-    } else {
-        // Smooth each component
-        for (int i = 0; i < 6; i++) {
-            c->smoothed_affine[i] = alpha * c->affine_matrix[i] +
-                                   (1.0f - alpha) * c->smoothed_affine[i];
-        }
-    }
+    c->trajectory[0] += c->affine_matrix[2];  // accumulate raw camera tx
+    c->trajectory[1] += c->affine_matrix[5];  // accumulate raw camera ty
 
-    //printf("[nv-stabilizer] Smoothed: tx=%.2f ty=%.2f\n", c->smoothed_affine[2], c->smoothed_affine[5]);
+    c->smoothed_trajectory[0] = alpha * c->trajectory[0] + (1.0f - alpha) * c->smoothed_trajectory[0];
+    c->smoothed_trajectory[1] = alpha * c->trajectory[1] + (1.0f - alpha) * c->smoothed_trajectory[1];
+
+    // Correction = smooth path − raw path  (negative = camera ahead, pull back)
+    float corr_x = c->smoothed_trajectory[0] - c->trajectory[0];
+    float corr_y = c->smoothed_trajectory[1] - c->trajectory[1];
+
+    // Clamp correction to 90% of crop margin so we never exceed the safe border
+    const int max_shift_x = (c->width  * 9) / 100;
+    const int max_shift_y = (c->height * 9) / 100;
+    corr_x = std::max(-(float)max_shift_x, std::min((float)max_shift_x, corr_x));
+    corr_y = std::max(-(float)max_shift_y, std::min((float)max_shift_y, corr_y));
+
+    c->smoothed_affine[0] = 1.0f; c->smoothed_affine[1] = 0.0f; c->smoothed_affine[2] = corr_x;
+    c->smoothed_affine[3] = 0.0f; c->smoothed_affine[4] = 1.0f; c->smoothed_affine[5] = corr_y;
+
+    // printf("[nv-stabilizer] traj=(%.1f,%.1f) smooth=(%.1f,%.1f) corr=(%.1f,%.1f)\n",
+    //        c->trajectory[0], c->trajectory[1],
+    //        c->smoothed_trajectory[0], c->smoothed_trajectory[1],
+    //        corr_x, corr_y);
 }
 
 static ProcStatus nv_stab_apply_stabilization(NvStabCtx* c, VP_Frame* output)
@@ -487,7 +525,7 @@ static ProcStatus nv_stab_apply_stabilization(NvStabCtx* c, VP_Frame* output)
         return PROC_STATUS_OK;
     }
 
-    printf("[nv-stabilizer] Applying stabilization: shift_x=%d shift_y=%d\n", shift_x, shift_y);
+    // printf("[nv-stabilizer] Applying stabilization: shift_x=%d shift_y=%d\n", shift_x, shift_y);
 
     // Lock VPI images for CPU access
     VPIImageData cur_data, out_data;
@@ -515,21 +553,54 @@ static ProcStatus nv_stab_apply_stabilization(NvStabCtx* c, VP_Frame* output)
     int width = c->width;
     int height = c->height;
 
-    // Apply frame shifting: compensate for detected motion
-    // To stabilize: shift frame in OPPOSITE direction of detected motion
+    // Crop margins: 10% border on each side to ensure no black borders appear
+    const int crop_margin_x = width * 10 / 100;
+    const int crop_margin_y = height * 10 / 100;
+
+    // Cropped region dimensions (80% of original)
+    const int crop_width = width - 2 * crop_margin_x;
+    const int crop_height = height - 2 * crop_margin_y;
+
+    // Apply crop, stabilize, then upscale back to original resolution
+    // This eliminates black borders by only using the safe center region
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            // Source coordinates after inverse shift
-            int src_x = x - shift_x;
-            int src_y = y - shift_y;
+            // Map output pixel (x,y) to position in cropped region
+            // Scale from full resolution to cropped resolution
+            float crop_x_f = crop_margin_x + (x * crop_width) / (float)width;
+            float crop_y_f = crop_margin_y + (y * crop_height) / (float)height;
 
-            if (src_x < 0 || src_x >= width || src_y < 0 || src_y >= height) {
-                // Out of bounds: fill with black
-                dst_buf[y * dst_stride + x] = 0;
-            } else {
-                // In bounds: copy from source
-                dst_buf[y * dst_stride + x] = src_buf[src_y * src_stride + src_x];
-            }
+            // Apply stabilization shift to the cropped coordinates
+            float src_x_f = crop_x_f + shift_x;
+            float src_y_f = crop_y_f + shift_y;
+
+            // Bilinear interpolation for smooth upscaling
+            int src_x0 = (int)src_x_f;
+            int src_y0 = (int)src_y_f;
+            int src_x1 = src_x0 + 1;
+            int src_y1 = src_y0 + 1;
+
+            float fx = src_x_f - src_x0;
+            float fy = src_y_f - src_y0;
+
+            // Clamp coordinates to valid range
+            src_x0 = std::max(0, std::min(width - 1, src_x0));
+            src_x1 = std::max(0, std::min(width - 1, src_x1));
+            src_y0 = std::max(0, std::min(height - 1, src_y0));
+            src_y1 = std::max(0, std::min(height - 1, src_y1));
+
+            // Get 4 neighboring pixels
+            uint8_t p00 = src_buf[src_y0 * src_stride + src_x0];
+            uint8_t p10 = src_buf[src_y0 * src_stride + src_x1];
+            uint8_t p01 = src_buf[src_y1 * src_stride + src_x0];
+            uint8_t p11 = src_buf[src_y1 * src_stride + src_x1];
+
+            // Bilinear interpolation
+            float p0 = p00 * (1.0f - fx) + p10 * fx;
+            float p1 = p01 * (1.0f - fx) + p11 * fx;
+            float result = p0 * (1.0f - fy) + p1 * fy;
+
+            dst_buf[y * dst_stride + x] = (uint8_t)(result + 0.5f);
         }
     }
 
@@ -537,29 +608,25 @@ static ProcStatus nv_stab_apply_stabilization(NvStabCtx* c, VP_Frame* output)
     vpiImageUnlock(c->out_img_y);
     vpiImageUnlock(c->cur_img_y);
 
-    //printf("[nv-stabilizer] Copying stabilized Y plane to output frame\n");
+    // Copy stabilized Y plane to output buffer
     VPIImageData stabilized_data;
     if (vpiImageLockData(c->out_img_y, VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &stabilized_data) == VPI_SUCCESS) {
-        //printf("[nv-stabilizer] Locked stabilized image for output copy\n");
         const uint8_t* stabilized_src = (const uint8_t*)stabilized_data.buffer.pitch.planes[0].data;
-        //printf("[nv-stabilizer] after stabilized_src\n");
-        if(!output->data) {
-            //printf("[nv-stabilizer] Output frame has no data buffer\n");
+        if (!output->data) {
             vpiImageUnlock(c->out_img_y);
             return PROC_STATUS_ERR_GENERAL;
         }
-        //printf("[nv-stabilizer] before output_dst\n");
         uint8_t* output_dst = (uint8_t*)output->data;
         int y_size = width * height;
-
-        // Copy Y plane only (UV passes through unchanged from input)
-        //printf("[nv-stabilizer] Copying bytes of Y plane to output\n");
         memcpy(output_dst, stabilized_src, y_size);
-
         vpiImageUnlock(c->out_img_y);
-        //printf("[nv-stabilizer] Stabilization applied to Y plane\n");
     }
-    //printf("[nv-stabilizer] Stabilization process complete for frame %lu\n", c->frame_count);
+
+    // UV plane: grayscale (B&W) video has no chroma — the UV plane is entirely
+    // neutral (0x80 / 128).  Shifting neutral values is a no-op, so we skip
+    // the UV correction entirely to avoid a per-frame heap allocation.
+    // If this is ever used with colour content, re-enable the UV shift block.
+
     return PROC_STATUS_OK;
 }
 
