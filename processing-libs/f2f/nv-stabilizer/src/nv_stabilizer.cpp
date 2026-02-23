@@ -59,12 +59,16 @@ typedef struct {
 
     // Harris corner detection
     VPIPayload harris_payload;
-    VPIArray keypoints_cur;
-    VPIArray keypoints_prev;
+    VPIArray keypoints_cur;        // Harris output keypoints (VPI_ARRAY_TYPE_KEYPOINT_F32)
+    VPIArray harris_scores;        // Harris output scores    (VPI_ARRAY_TYPE_F32)
     VPIHarrisCornerDetectorParams harris_params;
 
     // KLT feature tracking
+    // keypoints_prev    — reference boxes in the template frame  (KLT_TRACKED_BOUNDING_BOX)
+    // tracked_features  — initial position predictions            (KLT_TRACKED_BOUNDING_BOX)
+    // tracking_estimates— KLT output: tracked boxes in cur frame  (KLT_TRACKED_BOUNDING_BOX)
     VPIPayload klt_payload;
+    VPIArray keypoints_prev;
     VPIArray tracked_features;
     VPIArray tracking_estimates;
     VPIKLTFeatureTrackerParams klt_params;
@@ -184,25 +188,22 @@ static ProcStatus nv_stab_reset_context(NvStabCtx *c, int w, int h, int stride) 
         if (c->harris_payload) vpiPayloadDestroy(c->harris_payload);
         if (c->klt_payload) vpiPayloadDestroy(c->klt_payload);
         if (c->keypoints_cur) vpiArrayDestroy(c->keypoints_cur);
+        if (c->harris_scores) vpiArrayDestroy(c->harris_scores);
         if (c->keypoints_prev) vpiArrayDestroy(c->keypoints_prev);
         if (c->tracked_features) vpiArrayDestroy(c->tracked_features);
         if (c->tracking_estimates) vpiArrayDestroy(c->tracking_estimates);
 
-        // Create keypoint arrays (on processing thread for thread safety)
-        //printf("[nv-stabilizer] Creating VPI arrays\n");
-        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &c->keypoints_cur));
-        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &c->keypoints_prev));
-        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KEYPOINT_F32, 0, &c->tracked_features));
+        // Create arrays
+        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KEYPOINT_F32,             0, &c->keypoints_cur));
+        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_F32,                      0, &c->harris_scores));
+        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KLT_TRACKED_BOUNDING_BOX, 0, &c->keypoints_prev));
+        CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KLT_TRACKED_BOUNDING_BOX, 0, &c->tracked_features));
         CHECK_STATUS(vpiArrayCreate(500, VPI_ARRAY_TYPE_KLT_TRACKED_BOUNDING_BOX, 0, &c->tracking_estimates));
 
         // Create Harris corner detector
-        //printf("[nv-stabilizer] Creating Harris detector %dx%d\n", w, h);
         VPIStatus harris_st = vpiCreateHarrisCornerDetector(VPI_BACKEND_CUDA, w, h, &c->harris_payload);
         if (harris_st != VPI_SUCCESS) {
-            //printf("[nv-stabilizer] Harris creation FAILED: %s\n", vpiStatusGetName(harris_st));
             c->harris_payload = NULL;
-        } else {
-            //printf("[nv-stabilizer] Harris created: %p\n", c->harris_payload);
         }
 
         // Create KLT feature tracker
@@ -271,198 +272,191 @@ static ProcStatus nv_stab_prepare_frame(NvStabCtx* c, VP_Frame* frame)
 
 static ProcStatus nv_stab_detect_features(NvStabCtx *c)
 {
-    // Grid-based keypoint generation
-    //printf("[nv-stabilizer] detect_features: c=%p, keypoints_cur=%p\n", c, c->keypoints_cur);
-
-    VPIArrayData arrInit;
-    //printf("[nv-stabilizer] About to lock keypoints_cur array...\n");
-
-    CHECK_STATUS(vpiArrayLockData(c->keypoints_cur, VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &arrInit));
-
-    //printf("[nv-stabilizer] Successfully locked array\n");
-
-    VPIKeypointF32* kpts = (VPIKeypointF32*)arrInit.buffer.aos.data;
     int num_kpts = 0;
-    const int grid_spacing = 100;
 
-    //printf("[nv-stabilizer] Starting keypoint generation loop\n");
+    // Use Harris corner detector if available; fall back to uniform grid
+    if (c->harris_payload) {
+        CHECK_STATUS(vpiSubmitHarrisCornerDetector(
+            c->vpi_stream, VPI_BACKEND_CUDA, c->harris_payload,
+            c->cur_img_y, c->keypoints_cur, c->harris_scores, &c->harris_params));
+        CHECK_STATUS(vpiStreamSync(c->vpi_stream));
 
-    for (int y = 50; y < c->height && num_kpts < 500; y += grid_spacing) {
-        for (int x = 50; x < c->width && num_kpts < 500; x += grid_spacing) {
-            kpts[num_kpts].x = (float)x;
-            kpts[num_kpts].y = (float)y;
-            num_kpts++;
-        }
+        VPIArrayData kpData;
+        CHECK_STATUS(vpiArrayLockData(c->keypoints_cur, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &kpData));
+        num_kpts = *kpData.buffer.aos.sizePointer;
+        vpiArrayUnlock(c->keypoints_cur);
     }
 
-    //printf("[nv-stabilizer] Generated %d keypoints, setting size pointer\n", num_kpts);
+    // Fall back to evenly-spaced grid when Harris finds too few points
+    if (!c->harris_payload || num_kpts < 20) {
+        VPIArrayData arrInit;
+        CHECK_STATUS(vpiArrayLockData(c->keypoints_cur, VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &arrInit));
+        VPIKeypointF32* kpts = (VPIKeypointF32*)arrInit.buffer.aos.data;
+        num_kpts = 0;
+        const int grid_spacing = 80;
+        for (int y = 50; y < c->height && num_kpts < 500; y += grid_spacing)
+            for (int x = 50; x < c->width && num_kpts < 500; x += grid_spacing) {
+                kpts[num_kpts].x = (float)x;
+                kpts[num_kpts].y = (float)y;
+                num_kpts++;
+            }
+        *arrInit.buffer.aos.sizePointer = num_kpts;
+        vpiArrayUnlock(c->keypoints_cur);
+    }
 
-    *arrInit.buffer.aos.sizePointer = num_kpts;
+    // Convert keypoints → KLT bounding boxes.
+    // keypoints_prev  = reference boxes for the KLT template (cur_img_y; after the
+    //                   per-frame swap this will be prev_img_y which the tracker reads).
+    // tracked_features = identity predictions (same position — no prior motion known).
+    const float BOX = 21.0f;  // 21×21 pixel patch
+    const float HALF = BOX / 2.0f;
 
-    //printf("[nv-stabilizer] Unlocking array\n");
+    VPIArrayData kpData, refData, predData;
+    CHECK_STATUS(vpiArrayLockData(c->keypoints_cur,    VPI_LOCK_READ,  VPI_ARRAY_BUFFER_HOST_AOS, &kpData));
+    CHECK_STATUS(vpiArrayLockData(c->keypoints_prev,   VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &refData));
+    CHECK_STATUS(vpiArrayLockData(c->tracked_features, VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &predData));
 
+    VPIKeypointF32*           kpts    = (VPIKeypointF32*)kpData.buffer.aos.data;
+    VPIKLTTrackedBoundingBox* ref_bb  = (VPIKLTTrackedBoundingBox*)refData.buffer.aos.data;
+    VPIKLTTrackedBoundingBox* pred_bb = (VPIKLTTrackedBoundingBox*)predData.buffer.aos.data;
+    int n = *kpData.buffer.aos.sizePointer;
+
+    // VPIBoundingBox layout: top-left position in xform.mat3[r][2] (translation),
+    // scale in xform.mat3[0][0] / [1][1], homogeneous in mat3[2][2].
+    // Axis-aligned accessors: x = mat3[0][2], y = mat3[1][2],
+    //                         w = width*mat3[0][0], h = height*mat3[1][1]
+    for (int i = 0; i < n; i++) {
+        float bx = kpts[i].x - HALF;
+        float by = kpts[i].y - HALF;
+        bx = std::max(0.0f, std::min((float)(c->width  - (int)BOX - 1), bx));
+        by = std::max(0.0f, std::min((float)(c->height - (int)BOX - 1), by));
+
+        // Initialise both reference and prediction boxes identically
+        for (auto* bb : {&ref_bb[i], &pred_bb[i]}) {
+            memset(&bb->bbox.xform, 0, sizeof(bb->bbox.xform));
+            bb->bbox.xform.mat3[0][0] = 1.0f;  // x scale
+            bb->bbox.xform.mat3[1][1] = 1.0f;  // y scale
+            bb->bbox.xform.mat3[2][2] = 1.0f;  // homogeneous
+            bb->bbox.xform.mat3[0][2] = bx;    // left
+            bb->bbox.xform.mat3[1][2] = by;    // top
+            bb->bbox.width  = BOX;
+            bb->bbox.height = BOX;
+            bb->trackingStatus = 0;  // valid
+        }
+        ref_bb[i].templateStatus  = 1;  // force template extraction on first track
+        pred_bb[i].templateStatus = 0;  // prediction: no re-extraction needed
+    }
+    *refData.buffer.aos.sizePointer  = n;
+    *predData.buffer.aos.sizePointer = n;
+
+    vpiArrayUnlock(c->tracked_features);
+    vpiArrayUnlock(c->keypoints_prev);
     vpiArrayUnlock(c->keypoints_cur);
 
-    //printf("[nv-stabilizer] Generated %d grid-based keypoints\n", num_kpts);
+    c->num_tracked_points = n;
+    printf("[nv-stabilizer] Detected %d features\n", n);
     return PROC_STATUS_OK;
 }
 
 static ProcStatus nv_stab_track_features(NvStabCtx *c)
 {
     if (!c->has_prev_features) {
-        // First frame: just copy keypoints to prev and return
-        VPIArrayData curData, prevData;
-        CHECK_STATUS(vpiArrayLockData(c->keypoints_cur, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &curData));
-        CHECK_STATUS(vpiArrayLockData(c->keypoints_prev, VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &prevData));
-
-        int32_t numElements = *curData.buffer.aos.sizePointer;
-        size_t copySize = numElements * curData.buffer.aos.strideBytes;
-        memcpy(prevData.buffer.aos.data, curData.buffer.aos.data, copySize);
-        *prevData.buffer.aos.sizePointer = numElements;
-
-        vpiArrayUnlock(c->keypoints_prev);
-        vpiArrayUnlock(c->keypoints_cur);
-
+        // No valid previous frame yet (just after detection or first-ever frame).
+        // Reference boxes are already set up in keypoints_prev from detect_features.
+        // Mark as ready and wait for the next frame to actually run KLT.
         c->has_prev_features = true;
-        c->num_tracked_points = numElements;
-        //printf("[nv-stabilizer] First frame: stored %d grid keypoints\n", numElements);
         return PROC_STATUS_OK;
     }
 
-    // For grid-based points, simply re-generate and compute displacement
-    // Copy current to previous for motion estimation
-    VPIArrayData curData, prevData;
-    CHECK_STATUS(vpiArrayLockData(c->keypoints_cur, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &curData));
-    CHECK_STATUS(vpiArrayLockData(c->keypoints_prev, VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &prevData));
+    // Run KLT on GPU: track reference boxes from prev_img_y into cur_img_y.
+    //   templateImage  = prev_img_y   (the frame where reference patches live)
+    //   inputBoxList   = keypoints_prev   (reference boxes in template)
+    //   inputPredList  = tracked_features (predicted positions in cur frame)
+    //   outputBoxList  = tracking_estimates (tracked positions in cur frame)
+    CHECK_STATUS(vpiSubmitKLTFeatureTracker(
+        c->vpi_stream,
+        VPI_BACKEND_CUDA,
+        c->klt_payload,
+        c->prev_img_y,
+        c->keypoints_prev,
+        c->tracked_features,
+        c->cur_img_y,
+        c->tracking_estimates,
+        NULL,
+        &c->klt_params));
+    CHECK_STATUS(vpiStreamSync(c->vpi_stream));
 
-    int32_t numElements = *curData.buffer.aos.sizePointer;
-    size_t copySize = numElements * curData.buffer.aos.strideBytes;
-    memcpy(prevData.buffer.aos.data, curData.buffer.aos.data, copySize);
-    *prevData.buffer.aos.sizePointer = numElements;
+    // Count valid (not lost) features
+    VPIArrayData outData;
+    CHECK_STATUS(vpiArrayLockData(c->tracking_estimates, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &outData));
+    VPIKLTTrackedBoundingBox* out_bb = (VPIKLTTrackedBoundingBox*)outData.buffer.aos.data;
+    int total = *outData.buffer.aos.sizePointer;
+    int valid = 0;
+    for (int i = 0; i < total; i++)
+        if (out_bb[i].trackingStatus == 0) valid++;
+    vpiArrayUnlock(c->tracking_estimates);
 
-    vpiArrayUnlock(c->keypoints_prev);
-    vpiArrayUnlock(c->keypoints_cur);
-
-    c->num_tracked_points = numElements;
-    //printf("[nv-stabilizer] Prepared %d grid points for motion estimation\n", numElements);
-
+    c->num_tracked_points = valid;
+    printf("[nv-stabilizer] KLT tracked %d/%d features\n", valid, total);
     return PROC_STATUS_OK;
 }
 
 static ProcStatus nv_stab_estimate_motion(NvStabCtx* c)
 {
     if (c->num_tracked_points < 3) {
-        // Not enough points for affine estimation, use identity
         c->affine_matrix[0] = 1.0f; c->affine_matrix[1] = 0.0f; c->affine_matrix[2] = 0.0f;
         c->affine_matrix[3] = 0.0f; c->affine_matrix[4] = 1.0f; c->affine_matrix[5] = 0.0f;
-        //printf("[nv-stabilizer] Insufficient points, using identity motion\n");
         return PROC_STATUS_OK;
     }
 
-    // Read current and previous frame Y data directly for simple registration
-    // Use template matching on grid regions for robust motion estimation
-    VPIImageData cur_img_data, prev_img_data;
-    CHECK_STATUS(vpiImageLockData(c->cur_img_y, VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &cur_img_data));
-    CHECK_STATUS(vpiImageLockData(c->prev_img_y, VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &prev_img_data));
+    // Compute displacement from KLT results:
+    //   reference box center (in prev_img_y)  →  tracked box center (in cur_img_y)
+    //   = how much the camera moved this frame
+    VPIArrayData refData, outData;
+    CHECK_STATUS(vpiArrayLockData(c->keypoints_prev,     VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &refData));
+    CHECK_STATUS(vpiArrayLockData(c->tracking_estimates, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &outData));
 
-    uint8_t* cur_buf = (uint8_t*)cur_img_data.buffer.pitch.planes[0].data;
-    uint8_t* prev_buf = (uint8_t*)prev_img_data.buffer.pitch.planes[0].data;
-    int pitch = cur_img_data.buffer.pitch.planes[0].pitchBytes;
-    int width = c->width;
-    int height = c->height;
+    VPIKLTTrackedBoundingBox* ref_bb = (VPIKLTTrackedBoundingBox*)refData.buffer.aos.data;
+    VPIKLTTrackedBoundingBox* out_bb = (VPIKLTTrackedBoundingBox*)outData.buffer.aos.data;
+    int n = *refData.buffer.aos.sizePointer;
 
-    // Read keypoints to get grid positions
-    VPIArrayData kp_data;
-    CHECK_STATUS(vpiArrayLockData(c->keypoints_cur, VPI_LOCK_READ, VPI_ARRAY_BUFFER_HOST_AOS, &kp_data));
-    VPIKeypointF32* kpts = (VPIKeypointF32*)kp_data.buffer.aos.data;
-    int num_kpts = *kp_data.buffer.aos.sizePointer;
-
-    // Simple block matching at grid points
-    // Sample evenly across the whole grid rather than taking the first N points
-    // (the grid is enumerated top-to-bottom, so the first N are all in the top rows).
     std::vector<float> dxs, dys;
-    const int template_size = 15;  // 15x15 template
-    const int search_range = 30;   // Search ±30 pixels
-    const int sample_count = std::min(num_kpts, 80);
-    const int step = std::max(1, num_kpts / sample_count);
+    dxs.reserve(n); dys.reserve(n);
 
-    for (int ki = 0; ki < num_kpts && (int)dxs.size() < sample_count; ki += step) {
-        int k = ki;
-        int x = (int)kpts[k].x;
-        int y = (int)kpts[k].y;
+    for (int i = 0; i < n; i++) {
+        if (out_bb[i].trackingStatus != 0) continue;  // feature lost
 
-        // Bounds check for template extraction
-        if (x - template_size/2 < 0 || x + template_size/2 >= width ||
-            y - template_size/2 < 0 || y + template_size/2 >= height) {
-            continue;
-        }
+        // Center = translation + width/height*scale*0.5
+        float ref_cx = ref_bb[i].bbox.xform.mat3[0][2] + ref_bb[i].bbox.width  * ref_bb[i].bbox.xform.mat3[0][0] * 0.5f;
+        float ref_cy = ref_bb[i].bbox.xform.mat3[1][2] + ref_bb[i].bbox.height * ref_bb[i].bbox.xform.mat3[1][1] * 0.5f;
+        float out_cx = out_bb[i].bbox.xform.mat3[0][2] + out_bb[i].bbox.width  * out_bb[i].bbox.xform.mat3[0][0] * 0.5f;
+        float out_cy = out_bb[i].bbox.xform.mat3[1][2] + out_bb[i].bbox.height * out_bb[i].bbox.xform.mat3[1][1] * 0.5f;
 
-        // Extract template from previous frame
-        int best_dx = 0, best_dy = 0;
-        int best_error = INT_MAX;
-
-        for (int dy = -search_range; dy <= search_range; dy++) {
-            for (int dx = -search_range; dx <= search_range; dx++) {
-                int nx = x + dx;
-                int ny = y + dy;
-
-                if (nx - template_size/2 < 0 || nx + template_size/2 >= width ||
-                    ny - template_size/2 < 0 || ny + template_size/2 >= height) {
-                    continue;
-                }
-
-                // Compute SAD (Sum of Absolute Differences)
-                int error = 0;
-                for (int ty = -template_size/2; ty <= template_size/2; ty++) {
-                    for (int tx = -template_size/2; tx <= template_size/2; tx++) {
-                        int prev_idx = (y + ty) * pitch + (x + tx);
-                        int cur_idx = (ny + ty) * pitch + (nx + tx);
-                        error += abs((int)prev_buf[prev_idx] - (int)cur_buf[cur_idx]);
-                    }
-                }
-
-                if (error < best_error) {
-                    best_error = error;
-                    best_dx = dx;
-                    best_dy = dy;
-                }
-            }
-        }
-
-        dxs.push_back((float)best_dx);
-        dys.push_back((float)best_dy);
+        dxs.push_back(out_cx - ref_cx);
+        dys.push_back(out_cy - ref_cy);
     }
 
-    vpiArrayUnlock(c->keypoints_cur);
-    vpiImageUnlock(c->prev_img_y);
-    vpiImageUnlock(c->cur_img_y);
+    vpiArrayUnlock(c->tracking_estimates);
+    vpiArrayUnlock(c->keypoints_prev);
 
     if (dxs.empty()) {
-        //printf("[nv-stabilizer] No valid block matches, using identity\n");
         c->affine_matrix[0] = 1.0f; c->affine_matrix[1] = 0.0f; c->affine_matrix[2] = 0.0f;
         c->affine_matrix[3] = 0.0f; c->affine_matrix[4] = 1.0f; c->affine_matrix[5] = 0.0f;
         return PROC_STATUS_OK;
     }
 
-    // Median filter to get robust motion estimate
     std::sort(dxs.begin(), dxs.end());
     std::sort(dys.begin(), dys.end());
-    float med_dx = dxs[dxs.size() / 2];
-    float med_dy = dys[dys.size() / 2];
 
-    // Store raw inter-frame camera displacement (positive = camera moved right/down).
-    // The sign convention is: block match finds where in cur_frame the prev_frame
-    // template reappears, so dx/dy is the camera motion vector.
-    // DO NOT negate or scale here; smoothing will derive the correction.
     c->affine_matrix[0] = 1.0f;
     c->affine_matrix[1] = 0.0f;
-    c->affine_matrix[2] = med_dx;   // raw camera tx this frame
+    c->affine_matrix[2] = dxs[dxs.size() / 2];  // median camera tx
     c->affine_matrix[3] = 0.0f;
     c->affine_matrix[4] = 1.0f;
-    c->affine_matrix[5] = med_dy;   // raw camera ty this frame
+    c->affine_matrix[5] = dys[dys.size() / 2];  // median camera ty
 
-    //printf("[nv-stabilizer] Block match motion: dx=%.2f dy=%.2f (from %d matches)\n", med_dx, med_dy, (int)dxs.size());
-
+    printf("[nv-stabilizer] KLT motion: dx=%.2f dy=%.2f (%d valid features)\n",
+           c->affine_matrix[2], c->affine_matrix[5], (int)dxs.size());
     return PROC_STATUS_OK;
 }
 
@@ -674,7 +668,9 @@ static ProcStatus nv_stab_process(void* vctx, VP_Frame* input)
     st = nv_stab_apply_stabilization(c, input);
     if (st != PROC_STATUS_OK) return st;
 
-    // 6. Update for next frame: swap images
+    // 6. Update for next frame
+
+    // Swap images: cur_img_y becomes the new template (prev_img_y) for next frame
     VPIImage tmp_y = c->prev_img_y;
     c->prev_img_y = c->cur_img_y;
     c->cur_img_y = tmp_y;
@@ -683,10 +679,27 @@ static ProcStatus nv_stab_process(void* vctx, VP_Frame* input)
     c->prev_img_uv = c->cur_img_uv;
     c->cur_img_uv = tmp_uv;
 
-    // Swap keypoints
+    // KLT array rotation:
+    //   tracking_estimates now holds feature positions inside what just became prev_img_y.
+    //   Promote them to keypoints_prev (the reference for the next tracking call).
+    //   Also copy them into tracked_features as the initial position prediction.
     VPIArray tmp_kp = c->keypoints_prev;
-    c->keypoints_prev = c->keypoints_cur;
-    c->keypoints_cur = tmp_kp;
+    c->keypoints_prev = c->tracking_estimates;
+    c->tracking_estimates = tmp_kp;
+
+    {
+        VPIArrayData srcData, dstData;
+        CHECK_STATUS(vpiArrayLockData(c->keypoints_prev,   VPI_LOCK_READ,  VPI_ARRAY_BUFFER_HOST_AOS, &srcData));
+        CHECK_STATUS(vpiArrayLockData(c->tracked_features, VPI_LOCK_WRITE, VPI_ARRAY_BUFFER_HOST_AOS, &dstData));
+        int32_t n = *srcData.buffer.aos.sizePointer;
+        memcpy(dstData.buffer.aos.data, srcData.buffer.aos.data, n * srcData.buffer.aos.strideBytes);
+        *dstData.buffer.aos.sizePointer = n;
+        // Predictions should not force template re-extraction (templateStatus = 0)
+        VPIKLTTrackedBoundingBox* pred = (VPIKLTTrackedBoundingBox*)dstData.buffer.aos.data;
+        for (int i = 0; i < n; i++) pred[i].templateStatus = 0;
+        vpiArrayUnlock(c->tracked_features);
+        vpiArrayUnlock(c->keypoints_prev);
+    }
 
     return PROC_STATUS_OK;
 }
@@ -712,6 +725,7 @@ static void nv_stab_destroy(void* vctx)
     if (c->harris_payload) vpiPayloadDestroy(c->harris_payload);
     if (c->klt_payload) vpiPayloadDestroy(c->klt_payload);
     if (c->keypoints_cur) vpiArrayDestroy(c->keypoints_cur);
+    if (c->harris_scores) vpiArrayDestroy(c->harris_scores);
     if (c->keypoints_prev) vpiArrayDestroy(c->keypoints_prev);
     if (c->tracked_features) vpiArrayDestroy(c->tracked_features);
     if (c->tracking_estimates) vpiArrayDestroy(c->tracking_estimates);
