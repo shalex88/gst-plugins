@@ -1,7 +1,0 @@
-{
-  "name": "gstmyf2f",
-  "version": "0.0.0",
-  "dependencies": [
-    "yaml-cpp"
-  ]
-}

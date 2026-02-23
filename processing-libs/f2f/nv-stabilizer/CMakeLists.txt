@@ -1,11 +1,13 @@
 set(PROJECT_NAME nv-stabilizer)
 include(cmake/SetVersion.cmake)
-include(cmake/EnableVcpkg.cmake)
 
-if(CMAKE_CROSSCOMPILING)
+if(DEFINED ENV{CMAKE_TOOLCHAIN_FILE} AND DEFINED ENV{SDKTARGETSYSROOT})
     message(STATUS "Cross compilation")
+    message(STATUS "Toolchain: $ENV{CMAKE_TOOLCHAIN_FILE}")
+    message(STATUS "Sysroot: $ENV{SDKTARGETSYSROOT}")
 else()
     message(STATUS "Native compilation")
+    include(cmake/EnableVcpkg.cmake)
 endif()
 
 cmake_minimum_required(VERSION 3.22)
@@ -16,6 +18,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(VPI_INCLUDE_DIRS "${CMAKE_SYSROOT}/opt/nvidia/vpi3/include")
+set(VPI_LIBRARY_DIRS "${CMAKE_SYSROOT}/opt/nvidia/vpi3/lib/aarch64-linux-gnu/")
+if(NOT EXISTS "${VPI_INCLUDE_DIRS}" OR NOT EXISTS "${VPI_LIBRARY_DIRS}")
+    message(FATAL_ERROR "VPI is not found!")
+endif()
+
 set(SOURCE_DIR "src")
 set(CONFIG_DIR "config")
 
@@ -25,11 +33,11 @@ add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
-    /opt/nvidia/vpi3/include
+    ${VPI_INCLUDE_DIRS}
 )
 
 target_link_directories(${PROJECT_NAME} PRIVATE
-    /opt/nvidia/vpi3/lib/aarch64-linux-gnu/
+    ${VPI_LIBRARY_DIRS}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE

@@ -1,11 +1,13 @@
 set(PROJECT_NAME gstmyf2f)
 include(cmake/SetVersion.cmake)
-include(cmake/EnableVcpkg.cmake)
 
-if(CMAKE_CROSSCOMPILING)
+if(DEFINED ENV{CMAKE_TOOLCHAIN_FILE} AND DEFINED ENV{SDKTARGETSYSROOT})
     message(STATUS "Cross compilation")
+    message(STATUS "Toolchain: $ENV{CMAKE_TOOLCHAIN_FILE}")
+    message(STATUS "Sysroot: $ENV{SDKTARGETSYSROOT}")
 else()
     message(STATUS "Native compilation")
+    include(cmake/EnableVcpkg.cmake)
 endif()
 
 cmake_minimum_required(VERSION 3.22)
@@ -21,12 +23,13 @@ pkg_search_module(GSTREAMER REQUIRED IMPORTED_TARGET gstreamer-1.0)
 pkg_search_module(GST-BASE REQUIRED IMPORTED_TARGET gstreamer-base-1.0)
 find_package(yaml-cpp CONFIG REQUIRED)
 
-if (NOT CMAKE_CROSSCOMPILING)
-    set(DEEPSTREAM_INCLUDE_DIRS "/opt/nvidia/deepstream/deepstream/sources/includes")
-    set(DEEPSTREAM_LIBRARY_DIRS "/opt/nvidia/deepstream/deepstream/lib")
+set(DEEPSTREAM_INCLUDE_DIRS "${CMAKE_SYSROOT}/opt/nvidia/deepstream/deepstream/sources/includes")
+set(DEEPSTREAM_LIBRARY_DIRS "${CMAKE_SYSROOT}/opt/nvidia/deepstream/deepstream/lib")
+if(NOT EXISTS "${DEEPSTREAM_INCLUDE_DIRS}" OR NOT EXISTS "${DEEPSTREAM_LIBRARY_DIRS}")
+    message(FATAL_ERROR "DeepStream SDK is not found!")
 endif()
 
-set(VP_API_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/../../processing-libs/)
+set(VP_API_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../processing-libs/)
 
 set(SOURCE_DIR "src")
 set(CONFIG_DIR "config")
@@ -38,19 +41,20 @@ add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${VP_API_INCLUDE_DIR}
     ${DEEPSTREAM_INCLUDE_DIRS}
-    $ENV{TARGET_SYSROOT}/usr/src/jetson_multimedia_api/include/
+#    ${CMAKE_SYSROOT}/usr/src/jetson_multimedia_api/include/
 )
 
 target_link_directories(${PROJECT_NAME} PRIVATE
     ${DEEPSTREAM_LIBRARY_DIRS}
-    $ENV{TARGET_SYSROOT}/usr/lib/aarch64-linux-gnu/nvidia/
+#    ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/nvidia/
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GSTREAMER
     PkgConfig::GST-BASE
-    yaml-cpp::yaml-cpp
+    yaml-cpp
     nvbufsurface
+    ${YAML_CPP_TARGET}
 )
 
 include(GNUInstallDirs)
