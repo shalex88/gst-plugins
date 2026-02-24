@@ -31,6 +31,8 @@ file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS "${SOURCE_DIR}/*.cpp")
 
 add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
 
+find_package(yaml-cpp CONFIG REQUIRED)
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
     ${VPI_INCLUDE_DIRS}
@@ -42,6 +44,7 @@ target_link_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     nvvpi
+    yaml-cpp
 )
 
 include(GNUInstallDirs)
