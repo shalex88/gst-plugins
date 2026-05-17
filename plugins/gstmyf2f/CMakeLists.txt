@@ -80,7 +80,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 install(TARGETS ${PROJECT_NAME}
     COMPONENT runtime
     RUNTIME DESTINATION "${PROJECT_INSTALL_ROOT}"
-    LIBRARY DESTINATION "/usr/lib/aarch64-linux-gnu/gstreamer-1.0/"
+    LIBRARY DESTINATION "/usr/${CMAKE_INSTALL_LIBDIR}/gstreamer-1.0/"
 )
 
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/config/"

@@ -1,1 +1,12 @@
+# IDE files
+/.idea/
+/.vscode/
+
+# Build artifacts
 /*build*/
+
+# CMake generated files
+vcpkg.json
+
+# Logs
+/logs/

@@ -1,14 +1,7 @@
 {
   "name": "@PROJECT_NAME@",
   "version": "@VERSION@",
-  "builtin-baseline": "@VCPKG_BUILTIN_BASELINE@",
   "dependencies": [
     "yaml-cpp"
-  ],
-  "overrides": [
-    {
-      "name": "yaml-cpp",
-      "version": "0.7.0"
-    }
   ]
 }
