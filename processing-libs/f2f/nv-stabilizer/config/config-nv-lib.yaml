@@ -1,4 +1,0 @@
-name: name
-processing-lib-path: /opt/project-system/gst-plugins/processing-libs/video-stabilization/nv_stabilizer/build/libnv_stabilizer.so
-processing-lib-config-path: /opt/project-system/gst-plugins/processing-libs/video-stabilization/nv_stabilizer/resources/config-nv.yaml
-debug-first-run: true
