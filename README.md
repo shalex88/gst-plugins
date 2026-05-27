@@ -1,38 +1,20 @@
 # gst-plugins
 
-This workspace now supports a root CMake superbuild that always builds all discovered projects together.
+GStreamer plugins for frame-to-frame and frame-to-data processing.
+Each plugin loads a shared library that implements the actual processing.
+Each plugin and each processing library can be built and distributed separately.
 
-## Build From Root With Presets
-
-Configure and build all projects:
+## Build
 
 ```bash
 cmake --preset native-debug
 cmake --build --preset native-debug
 cmake --build --preset native-debug --target package
-```
-
-Cross presets are available:
-
-- cross-debug
-- cross-release
-
-## Build From Root Script
-
-The root wrapper always builds and packages all discovered projects:
-
-```bash
-./scripts/build.sh <native|cross> <debug|release>
-```
-
-Examples:
-
-```bash
+# Or via script:
 ./scripts/build.sh native debug
 ```
 
-## Add a New Subproject
+Available presets:
 
-1. Add a subdirectory that contains both CMakeLists.txt and CMakePresets.json.
-2. Reconfigure root preset so the superbuild re-discovers subprojects.
-3. Build using the default build target and package from root.
+- cross-debug
+- cross-release

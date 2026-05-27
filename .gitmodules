@@ -1,0 +1,6 @@
+[submodule "processing-libs/f2f/nv-stabilizer"]
+	path = processing-libs/f2f/nv-stabilizer
+	url = https://github.com/shalex88/nv-stabilizer.git
+[submodule "processing-libs/f2f/eyal-stabilizer"]
+	path = processing-libs/f2f/eyal-stabilizer
+	url = https://github.com/shalex88/eyal-stabilizer.git
